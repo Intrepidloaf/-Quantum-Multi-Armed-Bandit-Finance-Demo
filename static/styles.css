@@ -1,0 +1,44 @@
+/* styles.css */
+body {
+  font-family: Arial, sans-serif;
+  margin: 20px;
+  background: #f7f7f8;
+  color: #111;
+}
+.container {
+  max-width: 1100px;
+  margin: auto;
+  background: white;
+  padding: 20px;
+  border-radius: 8px;
+  box-shadow: 0 6px 20px rgba(0,0,0,0.06);
+}
+.controls {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+.controls label { font-size: 0.9rem; }
+.controls input[type="text"], .controls input[type="number"], .controls select {
+  padding: 6px 8px;
+  border-radius: 4px;
+  border: 1px solid #ddd;
+}
+button {
+  padding: 8px 12px;
+  border-radius: 6px;
+  border: none;
+  cursor: pointer;
+  background: #2563eb;
+  color: white;
+}
+#charts {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+.chart { height: 420px; background: #fff; padding: 10px; border-radius: 6px; }
+#status { margin-bottom: 8px; color: #333; }
+#results { margin-top: 16px; }
