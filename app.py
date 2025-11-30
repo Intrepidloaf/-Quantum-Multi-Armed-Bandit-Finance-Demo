@@ -1,160 +1,123 @@
-from flask import Flask, jsonify, request, render_template
 import numpy as np
 import pandas as pd
 import yfinance as yf
-import os
-import math
-from qae_module import quantum_positive_prob_estimate, classical_positive_prob_estimate
+from flask import Flask, render_template, jsonify, request
 
-app = Flask(__name__, static_folder='static', template_folder='templates')
+# ============================
+# QUANTUM MODULE
+# ============================
 
-# Default tickers for demo
-DEFAULT_TICKERS = ["AAPL", "MSFT", "GOOGL"]
-
-
-# ------------------------------
-# Route: Homepage
-# ------------------------------
-@app.route('/')
-def index():
-    return render_template('index.html')
+try:
+    from qiskit import QuantumCircuit
+    from qiskit_aer import AerSimulator
+    QISKIT_AVAILABLE = True
+except Exception:
+    QISKIT_AVAILABLE = False
 
 
-# ------------------------------
-# Route: Fetch Timeseries
-# ------------------------------
-@app.route('/api/fetch_timeseries', methods=['POST'])
-def fetch_timeseries():
-    """
-    Fetch adjusted close (or close) price data and return daily returns.
-    """
-    data = request.get_json()
-    tickers = data.get('tickers', DEFAULT_TICKERS)
-    period = data.get('period', '1y')
-    interval = data.get('interval', '1d')
+def classical_positive_prob(returns):
+    returns = np.asarray(returns)
+    return float(np.mean(returns > 0))
 
-    # Download data safely (handles yfinance version changes)
-    df = yf.download(
+
+def quantum_positive_prob(returns, shots=1024):
+    returns = np.asarray(returns)
+    p = classical_positive_prob(returns)
+    p = float(np.clip(p, 1e-6, 1 - 1e-6))
+
+    if not QISKIT_AVAILABLE:
+        samples = np.random.binomial(1, p, size=shots)
+        return float(np.mean(samples)), "simulated"
+
+    theta = np.arcsin(np.sqrt(p))
+    qc = QuantumCircuit(1, 1)
+    qc.ry(2 * theta, 0)
+    qc.measure(0, 0)
+
+    backend = AerSimulator()
+    result = backend.run(qc, shots=shots).result()
+    counts = result.get_counts()
+
+    return counts.get("1", 0) / shots, "aer"
+
+
+def prediction_accuracy(returns, prob):
+    preds = np.where(prob > 0.5, 1, -1)
+    actuals = np.where(returns > 0, 1, -1)
+    return float(np.mean(preds == actuals))
+
+
+# ============================
+# DATA PIPELINE (DYNAMIC)
+# ============================
+
+def run_pipeline(tickers, period, use_quantum=True, shots=1024):
+    raw = yf.download(
         tickers,
         period=period,
-        interval=interval,
-        auto_adjust=False,
-        progress=False,
-        threads=False
+        auto_adjust=True,
+        group_by="ticker"
     )
 
-    # Handle both single-ticker and multi-ticker cases
-    if isinstance(df.columns, pd.MultiIndex):
-        if 'Adj Close' in df.columns.levels[0]:
-            df = df['Adj Close']
-        elif 'Close' in df.columns.levels[0]:
-            df = df['Close']
-    else:
-        if 'Adj Close' in df.columns:
-            df = df['Adj Close']
-        elif 'Close' in df.columns:
-            df = df['Close']
+    results = []
+    all_returns = {}
 
-    # Compute daily returns
-    returns = df.pct_change().dropna()
+    for ticker in tickers:
+        df = raw[ticker] if len(tickers) > 1 else raw
+        prices = df["Close"]
+        returns = prices.pct_change().dropna().values
+        all_returns[ticker] = returns.tolist()
 
-    # Convert for JSON
-    returns_json = returns.reset_index().to_dict(orient='records')
-    return jsonify({'status': 'ok', 'tickers': list(returns.columns), 'returns': returns_json})
+        classical_p = classical_positive_prob(returns)
 
-
-# ------------------------------
-# Route: Estimate Probabilities
-# ------------------------------
-@app.route('/api/estimate', methods=['POST'])
-def estimate():
-    """
-    Estimate positive-return probabilities using classical and quantum (simulated) methods.
-    """
-    data = request.get_json()
-    tickers = data.get('tickers', DEFAULT_TICKERS)
-    period = data.get('period', '1y')
-    use_quantum = bool(data.get('use_quantum', True))
-    shots = int(data.get('shots', 1024))
-
-    # Download data safely (handles yfinance changes)
-    df = yf.download(
-        tickers,
-        period=period,
-        interval='1d',
-        auto_adjust=False,
-        progress=False,
-        threads=False
-    )
-
-    # Handle both single and multi-ticker cases
-    if isinstance(df.columns, pd.MultiIndex):
-        if 'Adj Close' in df.columns.levels[0]:
-            df = df['Adj Close']
-        elif 'Close' in df.columns.levels[0]:
-            df = df['Close']
-    else:
-        if 'Adj Close' in df.columns:
-            df = df['Adj Close']
-        elif 'Close' in df.columns:
-            df = df['Close']
-
-    # Compute daily returns
-    returns = df.pct_change().dropna()
-
-    results = {}
-    for t in tickers:
-        try:
-            series = returns[t].dropna()
-        except Exception:
-            results[t] = {'error': 'no data'}
-            continue
-
-        if series.empty:
-            results[t] = {'error': 'no valid data'}
-            continue
-
-        classical_mean = float(series.mean())
-        classical_pos_prob = float((series > 0).mean())
-
-        # Guard against NaN values
-        if math.isnan(classical_mean):
-            classical_mean = 0.0
-        if math.isnan(classical_pos_prob):
-            classical_pos_prob = 0.0
-
-        # Quantum path
         if use_quantum:
-            try:
-                quantum_est = float(quantum_positive_prob_estimate(series.values, shots=shots))
-                method = 'quantum'
-            except Exception as e:
-                print(f"[WARN] Quantum estimation failed for {t}: {e}")
-                quantum_est = float(classical_positive_prob_estimate(series.values))
-                method = 'fallback'
+            quantum_p, method = quantum_positive_prob(returns, shots)
         else:
-            quantum_est = float(classical_positive_prob_estimate(series.values))
-            method = 'classical'
+            quantum_p, method = None, "disabled"
 
-        if math.isnan(quantum_est):
-            quantum_est = 0.0
+        classical_acc = prediction_accuracy(returns, classical_p)
+        quantum_acc = prediction_accuracy(returns, quantum_p) if use_quantum else None
 
-        results[t] = {
-            'classical_mean': classical_mean,
-            'classical_positive_prob': classical_pos_prob,
-            'quantum_positive_prob': quantum_est,
-            'method_used': method,
-            'n_samples': int(len(series))
-        }
+        results.append({
+            "ticker": ticker,
+            "classical_p": round(classical_p, 4),
+            "quantum_p": round(quantum_p, 4) if quantum_p is not None else None,
+            "classical_acc": round(classical_acc, 4),
+            "quantum_acc": round(quantum_acc, 4) if quantum_acc is not None else None,
+            "method": method
+        })
 
-    print("DEBUG /api/estimate results:", results)
-    return jsonify({'status': 'ok', 'results': results})
+    return results, all_returns
 
 
-# ------------------------------
-# Main Entrypoint
-# ------------------------------
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    print(f"✅ Flask server running at: http://127.0.0.1:{port}")
-    app.run(debug=True, port=port)
+# ============================
+# FLASK APP
+# ============================
+
+app = Flask(__name__)
+
+
+@app.route("/")
+def home():
+    return render_template("index.html")
+
+
+@app.route("/run", methods=["POST"])
+def run_estimation():
+    data = request.json
+
+    tickers = [t.strip().upper() for t in data["tickers"].split(",")]
+    period = data["period"]
+    use_quantum = data["use_quantum"]
+    shots = int(data["shots"])
+
+    results, returns = run_pipeline(tickers, period, use_quantum, shots)
+
+    return jsonify({
+        "results": results,
+        "returns": returns
+    })
+
+
+if __name__ == "__main__":
+    app.run(debug=True)

@@ -1,86 +1,74 @@
-"""
-qae_module.py
-----------------------------------------
-Quantum + Classical Positive-Return Estimation Module
-for the Quantum Multi-Armed Bandit — Finance Demo.
-"""
-
+# qae_module.py
 import numpy as np
-import math
 
-# Try importing Qiskit and Aer
 try:
-    from qiskit import QuantumCircuit, transpile, Aer
-    from qiskit.utils import QuantumInstance
-    qiskit_available = True
-except Exception as e:
-    print(f"[WARN] Qiskit or Aer not available: {e}")
-    qiskit_available = False
+    from qiskit import QuantumCircuit
+    from qiskit_aer import AerSimulator
+    QISKIT_AVAILABLE = True
+except Exception:
+    QISKIT_AVAILABLE = False
 
 
-# ---------------------------------------------------------------------
-# Classical estimator
-# ---------------------------------------------------------------------
-def classical_positive_prob_estimate(values):
-    """Return the classical probability that returns > 0."""
-    if len(values) == 0:
+def classical_positive_prob(returns: np.ndarray) -> float:
+    """
+    Deterministic classical estimate:
+    P(return > 0) = (# positive returns) / N
+    """
+    returns = np.asarray(returns)
+    if len(returns) == 0:
         return 0.0
-    values = np.asarray(values)
-    return float(np.mean(values > 0))
+    return float(np.mean(returns > 0))
 
 
-# ---------------------------------------------------------------------
-# Quantum estimator (Aer simulation)
-# ---------------------------------------------------------------------
-def quantum_positive_prob_estimate(values, shots=1024):
+def quantum_positive_prob(
+    returns: np.ndarray,
+    shots: int = 1024,
+    force_classical_sim: bool = False,
+):
     """
-    Quantum Amplitude Estimation simulation of P(X>0).
-    Encodes classical probability as a qubit rotation
-    and measures it on the Aer simulator.
+    Quantum-style estimate of P(return > 0).
+
+    Steps:
+      1) Compute classical probability p.
+      2) Encode p as an amplitude of a single qubit:
+           p = sin^2(theta)  =>  theta = arcsin(sqrt(p))
+      3) Prepare |psi> = Ry(2*theta) |0>.
+      4) Measure with 'shots' samples to get p_q ≈ p, but with
+         quantum shot noise.
+
+    If Qiskit is not available OR force_classical_sim=True,
+    we simulate the same thing with np.random.binomial
+    (still gives a *different* sample estimate than p).
     """
+    returns = np.asarray(returns)
+    if len(returns) == 0:
+        return 0.0, "quantum-empty", 0
 
-    # --- 1. Fallback if Qiskit missing
-    if not qiskit_available:
-        print("[WARN] Qiskit not found, falling back to classical estimator.")
-        return classical_positive_prob_estimate(values)
+    # 1) classical underlying probability
+    p = classical_positive_prob(returns)
+    # clamp for numeric safety
+    p = float(np.clip(p, 1e-6, 1 - 1e-6))
 
-    try:
-        # --- 2. Compute classical probability baseline
-        p_classical = classical_positive_prob_estimate(values)
-        p_classical = float(np.clip(p_classical, 1e-3, 1 - 1e-3))
+    # --- Pure classical “quantum-style” fallback  -------------------------
+    if (not QISKIT_AVAILABLE) or force_classical_sim:
+        samples = np.random.binomial(1, p, size=shots)
+        p_hat = float(np.mean(samples))
+        return p_hat, "quantum-simulated", shots
 
-        # --- 3. Encode this probability on a single qubit
-        qc = QuantumCircuit(1, 1)
-        rotation_angle = 2 * math.asin(math.sqrt(p_classical))
-        qc.ry(rotation_angle, 0)
-        qc.measure(0, 0)
+    # --- True quantum sampling using Qiskit -------------------------------
+    # map probability -> rotation angle
+    theta = np.arcsin(np.sqrt(p))
 
-        # --- 4. Simulate with Aer
-        backend = Aer.get_backend("aer_simulator")
-        qc_t = transpile(qc, backend)
-        job = backend.run(qc_t, shots=shots)
-        counts = job.result().get_counts()
+    qc = QuantumCircuit(1, 1)
+    qc.ry(2 * theta, 0)   # prepare state with P(1) = p
+    qc.measure(0, 0)
 
-        # --- 5. Extract measured probability of outcome '1'
-        p1 = counts.get("1", 0) / shots
+    backend = AerSimulator()
+    job = backend.run(qc, shots=shots)
+    result = job.result()
+    counts = result.get_counts()
 
-        # --- 6. Add tiny quantum noise to simulate decoherence
-        quantum_est = p1 + np.random.normal(0, 0.01)
-        quantum_est = float(np.clip(quantum_est, 0, 1))
+    ones = counts.get("1", 0)
+    p_hat = ones / shots
 
-        return quantum_est
-
-    except Exception as e:
-        print(f"[ERROR] Quantum simulation failed: {e}")
-        return classical_positive_prob_estimate(values)
-
-
-# ---------------------------------------------------------------------
-# Simple manual test
-# ---------------------------------------------------------------------
-if __name__ == "__main__":
-    sample = np.random.normal(0.0005, 0.01, 500)
-    p_classical = classical_positive_prob_estimate(sample)
-    p_quantum = quantum_positive_prob_estimate(sample)
-    print(f"Classical P(>0): {p_classical:.4f}")
-    print(f"Quantum   P(>0): {p_quantum:.4f}")
+    return float(p_hat), "quantum-aer", shots
